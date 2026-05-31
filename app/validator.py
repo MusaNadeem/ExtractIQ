@@ -17,6 +17,7 @@ _MAX_YEAR = 2040
 class ValidationResult:
     data: InvoiceData
     warnings: list[str] = field(default_factory=list)
+    route: str = ""   # "text" | "vision" | "ocr"
 
 
 # ---------------------------------------------------------------------------

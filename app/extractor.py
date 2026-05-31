@@ -146,7 +146,17 @@ def _call_openai_vision(images) -> str:
 
 def extract_invoice(text: str) -> ValidationResult:
     """Extract invoice data from a pre-extracted text string."""
-    return validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
+    result = validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
+    result.route = "text"
+    return result
+
+
+def extract_invoice_from_image(image) -> ValidationResult:
+    """Extract invoice data from a single PIL Image."""
+    log.info("Route → vision  (direct image upload)")
+    result = validate_invoice(_extract_with_retry(lambda: _call_openai_vision([image])))
+    result.route = "vision"
+    return result
 
 
 def extract_invoice_from_pdf(path: Path) -> ValidationResult:
@@ -165,7 +175,9 @@ def extract_invoice_from_pdf(path: Path) -> ValidationResult:
 
     if _is_meaningful_text(text):
         log.info("[%s] Route → text   (%d chars via pdfplumber → GPT-4o text)", path.name, len(text))
-        return validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
+        result = validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
+        result.route = "text"
+        return result
 
     # Step 2: scanned / image-based PDF — use vision API
     log.info(
@@ -177,7 +189,9 @@ def extract_invoice_from_pdf(path: Path) -> ValidationResult:
     images = pdf_to_images(path)
 
     try:
-        return validate_invoice(_extract_with_retry(lambda: _call_openai_vision(images)))
+        result = validate_invoice(_extract_with_retry(lambda: _call_openai_vision(images)))
+        result.route = "vision"
+        return result
     except Exception as vision_exc:
         # Step 3: Tesseract last-resort fallback
         log.warning(
@@ -191,4 +205,6 @@ def extract_invoice_from_pdf(path: Path) -> ValidationResult:
         log.info(
             "[%s] OCR yielded %d chars — sending to GPT-4o text", path.name, len(ocr_text)
         )
-        return validate_invoice(_extract_with_retry(lambda: _call_openai_text(ocr_text)))
+        result = validate_invoice(_extract_with_retry(lambda: _call_openai_text(ocr_text)))
+        result.route = "ocr"
+        return result
