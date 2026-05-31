@@ -1,11 +1,14 @@
 import json
 import logging
 import os
+from io import BytesIO
 from pathlib import Path
 
 import pdfplumber
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
+from google.genai import types as _genai_types
+from PIL import Image as _PILImage
 
 from app.schemas.invoice import InvoiceData
 from app.validator import ValidationResult, validate_invoice
@@ -14,11 +17,10 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 
-_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+_MODEL = "gemini-2.0-flash"
 
-# Minimum characters (after strip) for extracted text to be considered usable
 _TEXT_MIN_CHARS = 100
-# Minimum ratio of printable characters — filters garbled/binary bleed-through
 _PRINTABLE_RATIO_MIN = 0.80
 
 _SYSTEM_PROMPT = """\
@@ -54,6 +56,43 @@ Rules:
 - Return ONLY the JSON object.\
 """
 
+_VISION_PROMPT = (
+    "Extract invoice data from this document image. "
+    "Return ONLY valid JSON as specified."
+)
+
+
+# ---------------------------------------------------------------------------
+# LLM interface — single call-through function
+# ---------------------------------------------------------------------------
+
+def call_llm(prompt: str, image=None) -> str:
+    """
+    Send a prompt to Gemini and return the raw text response.
+
+    image: PIL.Image.Image, raw bytes, or None.
+    For multi-page documents, stitch pages before calling (see _stitch_images).
+    """
+    if image is None:
+        contents = prompt
+    else:
+        if isinstance(image, bytes):
+            image = _PILImage.open(BytesIO(image))
+        contents = [prompt, image]
+
+    response = _client.models.generate_content(
+        model=_MODEL,
+        contents=contents,
+        config=_genai_types.GenerateContentConfig(
+            system_instruction=_SYSTEM_PROMPT,
+            temperature=0.0,
+        ),
+    )
+    text = response.text
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+    return text.strip()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,6 +109,20 @@ def _is_meaningful_text(text: str) -> bool:
 def _extract_pdfplumber(path: Path) -> str:
     with pdfplumber.open(path) as pdf:
         return "\n\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+
+
+def _stitch_images(images: list) -> _PILImage.Image:
+    """Stack multiple page images vertically into one for vision input."""
+    if len(images) == 1:
+        return images[0]
+    total_h = sum(img.height for img in images)
+    max_w = max(img.width for img in images)
+    canvas = _PILImage.new("RGB", (max_w, total_h), "white")
+    y = 0
+    for img in images:
+        canvas.paste(img, (0, y))
+        y += img.height
+    return canvas
 
 
 def _parse_response(raw: str) -> InvoiceData:
@@ -91,53 +144,8 @@ def _extract_with_retry(call_fn) -> InvoiceData:
             return _parse_response(raw)
         except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(
-                f"OpenAI returned malformed JSON after two attempts.\nLast response:\n{raw}"
+                f"Gemini returned malformed JSON after two attempts.\nLast response:\n{raw}"
             ) from exc
-
-
-# ---------------------------------------------------------------------------
-# OpenAI callers
-# ---------------------------------------------------------------------------
-
-def _call_openai_text(text: str) -> str:
-    response = _client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
-    )
-    return response.choices[0].message.content.strip()
-
-
-def _call_openai_vision(images) -> str:
-    from app.ocr import image_to_base64
-    content = [
-        {
-            "type": "text",
-            "text": "Extract invoice data from this document image. Return ONLY valid JSON as specified.",
-        }
-    ]
-    for img in images:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{image_to_base64(img)}",
-                    "detail": "high",
-                },
-            }
-        )
-    response = _client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-    )
-    return response.choices[0].message.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +154,7 @@ def _call_openai_vision(images) -> str:
 
 def extract_invoice(text: str) -> ValidationResult:
     """Extract invoice data from a pre-extracted text string."""
-    result = validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
+    result = validate_invoice(_extract_with_retry(lambda: call_llm(text)))
     result.route = "text"
     return result
 
@@ -154,7 +162,7 @@ def extract_invoice(text: str) -> ValidationResult:
 def extract_invoice_from_image(image) -> ValidationResult:
     """Extract invoice data from a single PIL Image."""
     log.info("Route → vision  (direct image upload)")
-    result = validate_invoice(_extract_with_retry(lambda: _call_openai_vision([image])))
+    result = validate_invoice(_extract_with_retry(lambda: call_llm(_VISION_PROMPT, image)))
     result.route = "vision"
     return result
 
@@ -162,9 +170,9 @@ def extract_invoice_from_image(image) -> ValidationResult:
 def extract_invoice_from_pdf(path: Path) -> ValidationResult:
     """
     Routing layer:
-      1. pdfplumber  → text long enough and clean  → GPT-4o text
-      2. pdfplumber  → too short / garbled          → GPT-4o vision
-      3. vision fails                                → Tesseract → GPT-4o text
+      1. pdfplumber  → text long enough and clean  → Gemini text
+      2. pdfplumber  → too short / garbled          → Gemini vision
+      3. vision fails                                → Tesseract → Gemini text
 
     Every path returns a ValidationResult with warnings attached.
     """
@@ -174,12 +182,12 @@ def extract_invoice_from_pdf(path: Path) -> ValidationResult:
     text = _extract_pdfplumber(path)
 
     if _is_meaningful_text(text):
-        log.info("[%s] Route → text   (%d chars via pdfplumber → GPT-4o text)", path.name, len(text))
-        result = validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
+        log.info("[%s] Route → text   (%d chars via pdfplumber → Gemini)", path.name, len(text))
+        result = validate_invoice(_extract_with_retry(lambda: call_llm(text)))
         result.route = "text"
         return result
 
-    # Step 2: scanned / image-based PDF — use vision API
+    # Step 2: scanned / image-based PDF — use vision
     log.info(
         "[%s] Route → vision  (pdfplumber yielded %d chars — too short or garbled)",
         path.name,
@@ -189,7 +197,8 @@ def extract_invoice_from_pdf(path: Path) -> ValidationResult:
     images = pdf_to_images(path)
 
     try:
-        result = validate_invoice(_extract_with_retry(lambda: _call_openai_vision(images)))
+        stitched = _stitch_images(images)
+        result = validate_invoice(_extract_with_retry(lambda: call_llm(_VISION_PROMPT, stitched)))
         result.route = "vision"
         return result
     except Exception as vision_exc:
@@ -203,8 +212,8 @@ def extract_invoice_from_pdf(path: Path) -> ValidationResult:
                 f"Could not extract readable text from '{path.name}' via any method."
             ) from vision_exc
         log.info(
-            "[%s] OCR yielded %d chars — sending to GPT-4o text", path.name, len(ocr_text)
+            "[%s] OCR yielded %d chars — sending to Gemini text", path.name, len(ocr_text)
         )
-        result = validate_invoice(_extract_with_retry(lambda: _call_openai_text(ocr_text)))
+        result = validate_invoice(_extract_with_retry(lambda: call_llm(ocr_text)))
         result.route = "ocr"
         return result
