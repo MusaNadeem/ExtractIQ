@@ -1,4 +1,3 @@
-import base64
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -15,10 +14,11 @@ def pdf_to_images(path: Path, dpi: int = 200) -> list[Image.Image]:
     return convert_from_path(str(path), dpi=dpi)
 
 
-def image_to_base64(image: Image.Image) -> str:
+def pil_to_jpeg_bytes(image: Image.Image, quality: int = 85) -> bytes:
+    """Convert a PIL Image to JPEG bytes for Gemini multimodal input."""
     buf = BytesIO()
-    image.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+    image.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 def ocr_images(images: list[Image.Image]) -> str:

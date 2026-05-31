@@ -12,10 +12,14 @@ Covers:
 
 import json
 import os
+import shutil
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from PIL import Image as _PILImage, ImageDraw
 
 os.environ.setdefault("GEMINI_API_KEY", "dummy-key-for-tests")
 
@@ -265,6 +269,104 @@ class TestExtractionChain(unittest.TestCase):
         # prompt should be the document text, not the system prompt
         prompt_arg = call_args.args[0] if call_args.args else call_args.kwargs["prompt"]
         self.assertEqual(prompt_arg, _INVOICE_TEXT)
+
+
+# ---------------------------------------------------------------------------
+# Vision path — real image-based PDF, mocked call_llm
+# ---------------------------------------------------------------------------
+
+def _make_image_pdf(path: Path) -> None:
+    """Create a PDF whose content is a rasterised image (no extractable text)."""
+    img = _PILImage.new("RGB", (800, 1000), "white")
+    draw = ImageDraw.Draw(img)
+    lines = [
+        "INVOICE #INV-SCAN-001",
+        "Vendor: Scanned Corp, 99 Paper Lane",
+        "Date: 2024-03-10     Due: 2024-04-10",
+        "",
+        "Item A   x1   $200.00   $200.00",
+        "Item B   x3    $15.00    $45.00",
+        "",
+        "Subtotal $245.00   Tax $24.50   Total $269.50",
+        "Currency: USD",
+    ]
+    for i, line in enumerate(lines):
+        draw.text((60, 80 + i * 40), line, fill="black")
+    img.save(str(path), format="PDF")
+
+
+class TestVisionPath(unittest.TestCase):
+    """
+    Uses a Pillow-generated image PDF (pdfplumber extracts zero text) to
+    confirm the vision route fires and returns structured InvoiceData.
+    No real Gemini API calls are made.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        cls._pdf_path = Path(cls._tmpdir) / "scanned_invoice.pdf"
+        _make_image_pdf(cls._pdf_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    @patch("app.extractor.call_llm", return_value=_VALID_INVOICE_JSON)
+    def test_scanned_pdf_takes_vision_route(self, mock_llm):
+        with self.assertLogs("app.extractor", level="INFO") as cm:
+            result = extract_invoice_from_pdf(self._pdf_path)
+
+        route_logs = [l for l in cm.output if "Route" in l]
+        self.assertTrue(any("vision" in l for l in route_logs),
+                        f"Expected vision route, got: {route_logs}")
+        self.assertEqual(result.route, "vision")
+        self.assertIsInstance(result, ValidationResult)
+
+    @patch("app.extractor.call_llm", return_value=_VALID_INVOICE_JSON)
+    def test_call_llm_receives_pil_image(self, mock_llm):
+        extract_invoice_from_pdf(self._pdf_path)
+
+        args, kwargs = mock_llm.call_args
+        image_arg = kwargs.get("image") if kwargs else (args[1] if len(args) > 1 else None)
+        self.assertIsNotNone(image_arg, "call_llm should receive an image argument")
+        self.assertIsInstance(image_arg, _PILImage.Image,
+                              f"Expected PIL Image, got {type(image_arg)}")
+
+    @patch("app.extractor.call_llm", return_value=_VALID_INVOICE_JSON)
+    def test_returns_valid_invoice_data_from_vision(self, mock_llm):
+        result = extract_invoice_from_pdf(self._pdf_path)
+
+        self.assertEqual(result.data.vendor_name, "Acme Corp")
+        self.assertAlmostEqual(result.data.total, 192.50)
+        self.assertEqual(len(result.data.line_items), 2)
+
+    def test_pil_image_converted_to_jpeg_part(self):
+        """call_llm internally wraps PIL images in a typed JPEG Part."""
+        from google.genai import types
+        from app.extractor import call_llm
+
+        captured = {}
+
+        def fake_generate(model, contents, config):
+            captured["contents"] = contents
+
+            class FakeResponse:
+                text = _VALID_INVOICE_JSON
+            return FakeResponse()
+
+        with patch("app.extractor._client") as mock_client:
+            mock_client.models.generate_content.side_effect = fake_generate
+            img = _PILImage.new("RGB", (100, 100), "white")
+            call_llm("extract this", image=img)
+
+        parts = captured["contents"]
+        self.assertIsInstance(parts, list)
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0], "extract this")
+        image_part = parts[1]
+        self.assertIsInstance(image_part, types.Part)
+        self.assertEqual(image_part.inline_data.mime_type, "image/jpeg")
 
 
 if __name__ == "__main__":

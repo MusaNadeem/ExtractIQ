@@ -70,15 +70,26 @@ def call_llm(prompt: str, image=None) -> str:
     """
     Send a prompt to Gemini and return the raw text response.
 
-    image: PIL.Image.Image, raw bytes, or None.
-    For multi-page documents, stitch pages before calling (see _stitch_images).
+    image: PIL.Image.Image or raw JPEG/PNG bytes, or None.
+    PIL Images are converted to JPEG and wrapped in a typed Part so
+    the format is explicit rather than relying on SDK duck-typing.
+    For multi-page documents, stitch pages before calling (_stitch_images).
     """
     if image is None:
         contents = prompt
     else:
-        if isinstance(image, bytes):
-            image = _PILImage.open(BytesIO(image))
-        contents = [prompt, image]
+        if isinstance(image, _PILImage.Image):
+            buf = BytesIO()
+            image.convert("RGB").save(buf, format="JPEG", quality=85)
+            image_bytes = buf.getvalue()
+        else:
+            image_bytes = image  # caller supplies raw bytes
+
+        image_part = _genai_types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/jpeg",
+        )
+        contents = [prompt, image_part]
 
     response = _client.models.generate_content(
         model=_MODEL,
