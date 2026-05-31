@@ -1,0 +1,12 @@
+openai
+pdfplumber
+pdf2image
+Pillow
+pytesseract
+pydantic
+fastapi
+uvicorn
+streamlit
+pandas
+openpyxl
+python-dotenv
