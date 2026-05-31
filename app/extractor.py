@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from app.schemas.invoice import InvoiceData
+from app.validator import ValidationResult, validate_invoice
 
 load_dotenv()
 
@@ -143,17 +144,19 @@ def _call_openai_vision(images) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def extract_invoice(text: str) -> InvoiceData:
+def extract_invoice(text: str) -> ValidationResult:
     """Extract invoice data from a pre-extracted text string."""
-    return _extract_with_retry(lambda: _call_openai_text(text))
+    return validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
 
 
-def extract_invoice_from_pdf(path: Path) -> InvoiceData:
+def extract_invoice_from_pdf(path: Path) -> ValidationResult:
     """
     Routing layer:
       1. pdfplumber  → text long enough and clean  → GPT-4o text
       2. pdfplumber  → too short / garbled          → GPT-4o vision
       3. vision fails                                → Tesseract → GPT-4o text
+
+    Every path returns a ValidationResult with warnings attached.
     """
     path = Path(path)
 
@@ -162,7 +165,7 @@ def extract_invoice_from_pdf(path: Path) -> InvoiceData:
 
     if _is_meaningful_text(text):
         log.info("[%s] Route → text   (%d chars via pdfplumber → GPT-4o text)", path.name, len(text))
-        return _extract_with_retry(lambda: _call_openai_text(text))
+        return validate_invoice(_extract_with_retry(lambda: _call_openai_text(text)))
 
     # Step 2: scanned / image-based PDF — use vision API
     log.info(
@@ -174,7 +177,7 @@ def extract_invoice_from_pdf(path: Path) -> InvoiceData:
     images = pdf_to_images(path)
 
     try:
-        return _extract_with_retry(lambda: _call_openai_vision(images))
+        return validate_invoice(_extract_with_retry(lambda: _call_openai_vision(images)))
     except Exception as vision_exc:
         # Step 3: Tesseract last-resort fallback
         log.warning(
@@ -188,4 +191,4 @@ def extract_invoice_from_pdf(path: Path) -> InvoiceData:
         log.info(
             "[%s] OCR yielded %d chars — sending to GPT-4o text", path.name, len(ocr_text)
         )
-        return _extract_with_retry(lambda: _call_openai_text(ocr_text))
+        return validate_invoice(_extract_with_retry(lambda: _call_openai_text(ocr_text)))
